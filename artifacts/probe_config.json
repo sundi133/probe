@@ -2575,8 +2575,8 @@
     -0.003918270114809275,
     0.005430697463452816
   ],
-  "threshold_block": 0.5,
-  "threshold_allow": 0.0,
+  "threshold_block": 1.0,
+  "threshold_allow": 0.5,
   "hidden_norm": 1.0,
   "score_stats": {
     "harmful_mean": 0.7937,
