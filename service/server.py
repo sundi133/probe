@@ -51,6 +51,8 @@ PROBE_CONFIG = Path(os.environ.get("PROBE_CONFIG", "./artifacts/probe_config.jso
 MAX_LENGTH   = int(os.environ.get("MAX_LENGTH", "512"))
 PORT         = int(os.environ.get("PORT", str(DEFAULT_PORT)))
 HOST         = os.environ.get("HOST", "0.0.0.0")
+COMPILE      = os.environ.get("PROBE_COMPILE", "0") == "1"
+WARMUP       = os.environ.get("PROBE_WARMUP", "1") == "1"
 DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
 
 STATE = {
@@ -141,6 +143,10 @@ def _load_model_and_probe():
     direction = torch.tensor(probe["global_direction"],
                              dtype=torch.float32, device=DEVICE)
 
+    if COMPILE:
+        log.info("wrapping base in torch.compile(mode=reduce-overhead, dynamic=True)")
+        base = torch.compile(base, mode="reduce-overhead", dynamic=True)
+
     STATE["model"]       = model
     STATE["base"]        = base
     STATE["tokenizer"]   = tok
@@ -148,6 +154,19 @@ def _load_model_and_probe():
     STATE["global_dir"]  = direction
     STATE["hook_buffer"] = hook_buf
     STATE["ready"]       = True
+
+    if WARMUP:
+        log.info("running warmup forward(s)" + (" — torch.compile will compile now" if COMPILE else ""))
+        t0 = time.perf_counter()
+        for txt in ["hello", "what is two plus two"]:
+            enc = tok(txt, return_tensors="pt", truncation=True,
+                      max_length=MAX_LENGTH, padding=True).to(DEVICE)
+            with torch.inference_mode():
+                base(**enc)
+        if DEVICE == "cuda":
+            torch.cuda.synchronize()
+        log.info(f"warmup done in {(time.perf_counter()-t0):.1f}s")
+
     log.info("service ready")
 
 
@@ -244,6 +263,13 @@ def _parse_args() -> argparse.Namespace:
                    help="fallback HF model id (env: MODEL)")
     p.add_argument("--max-length", type=int, default=MAX_LENGTH,
                    help="tokenizer truncation length (env: MAX_LENGTH)")
+    p.add_argument("--compile", action="store_true", default=COMPILE,
+                   help="wrap model in torch.compile; "
+                        "first request compiles (~30s), subsequent are faster "
+                        "(env: PROBE_COMPILE=1)")
+    p.add_argument("--no-warmup", action="store_true",
+                   help="skip the warmup forward pass at startup "
+                        "(default: warm up)")
     p.add_argument("--log-level", default="info",
                    help="uvicorn log level")
     return p.parse_args()
@@ -252,12 +278,15 @@ def _parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     args = _parse_args()
     # CLI flags win over env vars; propagate back so lifespan startup sees them
-    os.environ["MODEL"]        = args.model
-    os.environ["PROBE_CONFIG"] = args.probe_config
-    os.environ["MAX_LENGTH"]   = str(args.max_length)
+    os.environ["MODEL"]          = args.model
+    os.environ["PROBE_CONFIG"]   = args.probe_config
+    os.environ["MAX_LENGTH"]     = str(args.max_length)
+    os.environ["PROBE_COMPILE"]  = "1" if args.compile else "0"
+    os.environ["PROBE_WARMUP"]   = "0" if args.no_warmup else "1"
     MODEL_PATH   = args.model
     PROBE_CONFIG = Path(args.probe_config)
     MAX_LENGTH   = args.max_length
-    log.info(f"starting uvicorn on {args.host}:{args.port}")
+    log.info(f"starting uvicorn on {args.host}:{args.port}  "
+             f"compile={args.compile}  warmup={not args.no_warmup}")
     uvicorn.run("server:app", host=args.host, port=args.port,
                 log_level=args.log_level)
