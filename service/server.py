@@ -4,6 +4,11 @@ Probe Inference Service
 FastAPI server that loads the base model + artifacts/probe_config.json
 and scores prompts for harmfulness using the refusal-direction probe.
 
+Optimisations in this build:
+  * model truncated to best_layer+1 layers (no wasted compute past the probe)
+  * lm_head dropped; forward hook captures the hidden state we need
+  * output_hidden_states=True is NOT used (no materialising all layers)
+
 Boot (env vars):
   MODEL=votal-ai/vai35-4B \
   PROBE_CONFIG=./artifacts/probe_config.json \
@@ -26,6 +31,7 @@ import json
 import time
 import argparse
 import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import List, Optional
 
@@ -45,15 +51,16 @@ PROBE_CONFIG = Path(os.environ.get("PROBE_CONFIG", "./artifacts/probe_config.jso
 MAX_LENGTH   = int(os.environ.get("MAX_LENGTH", "512"))
 PORT         = int(os.environ.get("PORT", str(DEFAULT_PORT)))
 HOST         = os.environ.get("HOST", "0.0.0.0")
+COMPILE      = os.environ.get("PROBE_COMPILE", "0") == "1"
+WARMUP       = os.environ.get("PROBE_WARMUP", "1") == "1"
 DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
-
-app = FastAPI(title="Probe Inference Service", version="1.0")
 
 STATE = {
     "model": None,
     "tokenizer": None,
     "probe": None,
     "global_dir": None,
+    "hook_buffer": None,
     "ready": False,
 }
 
@@ -64,7 +71,7 @@ class ScoreRequest(BaseModel):
 
 
 class BatchScoreRequest(BaseModel):
-    texts: List[str] = Field(..., min_items=1, max_items=64)
+    texts: List[str] = Field(..., min_length=1, max_length=64)
     threshold: Optional[float] = None
 
 
@@ -82,56 +89,131 @@ class BatchScoreResponse(BaseModel):
     latency_ms: float
 
 
-@app.on_event("startup")
-def load_everything():
+def _load_model_and_probe():
     if not PROBE_CONFIG.exists():
         raise RuntimeError(f"probe config not found: {PROBE_CONFIG}")
 
     log.info(f"loading probe config {PROBE_CONFIG}")
     probe = json.loads(PROBE_CONFIG.read_text())
     model_id = probe.get("model", MODEL_PATH)
-    log.info(f"model={model_id}  layer={probe['best_layer']}  "
+    layer = int(probe["best_layer"])
+    log.info(f"model={model_id}  layer={layer}  "
              f"threshold={probe['threshold_block']}  device={DEVICE}")
 
     tok = AutoTokenizer.from_pretrained(model_id)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+
     dtype = torch.bfloat16 if DEVICE == "cuda" else torch.float32
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         torch_dtype=dtype,
         device_map=DEVICE,
-        output_hidden_states=True,
     )
     model.eval()
 
-    direction = torch.tensor(probe["global_direction"], dtype=torch.float32, device=DEVICE)
+    # Truncate: hidden_states[layer] in HF equals the output of the first `layer`
+    # transformer blocks (hidden_states[0] is embeddings). Keep exactly that many.
+    base = getattr(model, "model", model)
+    if hasattr(base, "layers"):
+        n_total = len(base.layers)
+        if layer > n_total:
+            raise RuntimeError(
+                f"best_layer={layer} > model depth {n_total}. "
+                f"Regenerate probe_config.json against this model."
+            )
+        base.layers = base.layers[:layer]
+        log.info(f"truncated transformer layers: {n_total} -> {layer}")
+    else:
+        log.warning("base.layers not found; running full forward")
 
-    STATE["model"]      = model
-    STATE["tokenizer"]  = tok
-    STATE["probe"]      = probe
-    STATE["global_dir"] = direction
-    STATE["ready"]      = True
+    # Drop the LM head so it's never called
+    if hasattr(model, "lm_head"):
+        model.lm_head = torch.nn.Identity()
+
+    # Forward hook on the last (kept) layer grabs its output.
+    hook_buf: dict = {}
+
+    def _hook(_mod, _inp, out):
+        # layer forward returns either Tensor or (Tensor, ...) depending on model
+        hook_buf["h"] = out[0] if isinstance(out, tuple) else out
+
+    base.layers[-1].register_forward_hook(_hook)
+
+    direction = torch.tensor(probe["global_direction"],
+                             dtype=torch.float32, device=DEVICE)
+
+    if COMPILE:
+        # "default" mode avoids CUDA graphs, which are too strict for models
+        # with dynamic-stride ops like Qwen3.5's linear-attention fallback.
+        # For models that tolerate it, export PROBE_COMPILE_MODE=reduce-overhead.
+        compile_mode = os.environ.get("PROBE_COMPILE_MODE", "default")
+        log.info(f"wrapping base in torch.compile(mode={compile_mode}, dynamic=True)")
+        try:
+            base = torch.compile(base, mode=compile_mode, dynamic=True)
+        except Exception as e:
+            log.warning(f"torch.compile failed ({e}); continuing without compile")
+
+    STATE["model"]       = model
+    STATE["base"]        = base
+    STATE["tokenizer"]   = tok
+    STATE["probe"]       = probe
+    STATE["global_dir"]  = direction
+    STATE["hook_buffer"] = hook_buf
+    STATE["ready"]       = True
+
+    if WARMUP:
+        log.info("running warmup forward(s)" + (" — torch.compile will compile now" if COMPILE else ""))
+        t0 = time.perf_counter()
+        try:
+            for txt in ["hello", "what is two plus two"]:
+                enc = tok(txt, return_tensors="pt", truncation=True,
+                          max_length=MAX_LENGTH, padding=True).to(DEVICE)
+                with torch.inference_mode():
+                    base(**enc)
+            if DEVICE == "cuda":
+                torch.cuda.synchronize()
+            log.info(f"warmup done in {(time.perf_counter()-t0):.1f}s")
+        except Exception as e:
+            log.warning(f"warmup failed ({e}); disabling torch.compile and reloading uncompiled model")
+            if COMPILE:
+                # unwrap compiled module back to the original base
+                inner = getattr(base, "_orig_mod", None)
+                if inner is not None:
+                    base = inner
+                    STATE["base"] = base
+                log.info("continuing without torch.compile")
+
     log.info("service ready")
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    _load_model_and_probe()
+    yield
+
+
+app = FastAPI(title="Probe Inference Service", version="1.1", lifespan=lifespan)
 
 
 @torch.inference_mode()
 def _score_texts(texts: List[str]) -> List[float]:
-    tok   = STATE["tokenizer"]
-    model = STATE["model"]
-    probe = STATE["probe"]
-    d     = STATE["global_dir"]
-    layer = probe["best_layer"]
+    tok  = STATE["tokenizer"]
+    base = STATE["base"]
+    d    = STATE["global_dir"]
+    buf  = STATE["hook_buffer"]
 
     enc = tok(texts, return_tensors="pt", truncation=True,
               max_length=MAX_LENGTH, padding=True).to(DEVICE)
-    out = model(**enc, output_hidden_states=True)
 
-    hidden = out.hidden_states[layer].float()           # [B, T, H]
-    mask   = enc["attention_mask"]                      # [B, T]
-    last   = mask.sum(dim=1) - 1                        # index of last real token
+    # Run the base transformer (no lm_head). The hook populates buf["h"].
+    base(**enc)
+    hidden = buf["h"].float()                  # [B, T, H]
+    mask   = enc["attention_mask"]              # [B, T]
+    last   = mask.sum(dim=1) - 1                # last real token index per row
     idx    = torch.arange(hidden.size(0), device=hidden.device)
-    last_hidden = hidden[idx, last, :]                  # [B, H]
-    scores = (last_hidden @ d).tolist()
-    return scores
+    last_hidden = hidden[idx, last, :]          # [B, H]
+    return (last_hidden @ d).tolist()
 
 
 @app.get("/health")
@@ -198,6 +280,13 @@ def _parse_args() -> argparse.Namespace:
                    help="fallback HF model id (env: MODEL)")
     p.add_argument("--max-length", type=int, default=MAX_LENGTH,
                    help="tokenizer truncation length (env: MAX_LENGTH)")
+    p.add_argument("--compile", action="store_true", default=COMPILE,
+                   help="wrap model in torch.compile; "
+                        "first request compiles (~30s), subsequent are faster "
+                        "(env: PROBE_COMPILE=1)")
+    p.add_argument("--no-warmup", action="store_true",
+                   help="skip the warmup forward pass at startup "
+                        "(default: warm up)")
     p.add_argument("--log-level", default="info",
                    help="uvicorn log level")
     return p.parse_args()
@@ -205,13 +294,16 @@ def _parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = _parse_args()
-    # CLI flags win over env vars; propagate back so @on_event startup sees them
-    os.environ["MODEL"]        = args.model
-    os.environ["PROBE_CONFIG"] = args.probe_config
-    os.environ["MAX_LENGTH"]   = str(args.max_length)
+    # CLI flags win over env vars; propagate back so lifespan startup sees them
+    os.environ["MODEL"]          = args.model
+    os.environ["PROBE_CONFIG"]   = args.probe_config
+    os.environ["MAX_LENGTH"]     = str(args.max_length)
+    os.environ["PROBE_COMPILE"]  = "1" if args.compile else "0"
+    os.environ["PROBE_WARMUP"]   = "0" if args.no_warmup else "1"
     MODEL_PATH   = args.model
     PROBE_CONFIG = Path(args.probe_config)
     MAX_LENGTH   = args.max_length
-    log.info(f"starting uvicorn on {args.host}:{args.port}")
+    log.info(f"starting uvicorn on {args.host}:{args.port}  "
+             f"compile={args.compile}  warmup={not args.no_warmup}")
     uvicorn.run("server:app", host=args.host, port=args.port,
                 log_level=args.log_level)
