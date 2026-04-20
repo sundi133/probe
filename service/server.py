@@ -144,8 +144,15 @@ def _load_model_and_probe():
                              dtype=torch.float32, device=DEVICE)
 
     if COMPILE:
-        log.info("wrapping base in torch.compile(mode=reduce-overhead, dynamic=True)")
-        base = torch.compile(base, mode="reduce-overhead", dynamic=True)
+        # "default" mode avoids CUDA graphs, which are too strict for models
+        # with dynamic-stride ops like Qwen3.5's linear-attention fallback.
+        # For models that tolerate it, export PROBE_COMPILE_MODE=reduce-overhead.
+        compile_mode = os.environ.get("PROBE_COMPILE_MODE", "default")
+        log.info(f"wrapping base in torch.compile(mode={compile_mode}, dynamic=True)")
+        try:
+            base = torch.compile(base, mode=compile_mode, dynamic=True)
+        except Exception as e:
+            log.warning(f"torch.compile failed ({e}); continuing without compile")
 
     STATE["model"]       = model
     STATE["base"]        = base
@@ -158,14 +165,24 @@ def _load_model_and_probe():
     if WARMUP:
         log.info("running warmup forward(s)" + (" — torch.compile will compile now" if COMPILE else ""))
         t0 = time.perf_counter()
-        for txt in ["hello", "what is two plus two"]:
-            enc = tok(txt, return_tensors="pt", truncation=True,
-                      max_length=MAX_LENGTH, padding=True).to(DEVICE)
-            with torch.inference_mode():
-                base(**enc)
-        if DEVICE == "cuda":
-            torch.cuda.synchronize()
-        log.info(f"warmup done in {(time.perf_counter()-t0):.1f}s")
+        try:
+            for txt in ["hello", "what is two plus two"]:
+                enc = tok(txt, return_tensors="pt", truncation=True,
+                          max_length=MAX_LENGTH, padding=True).to(DEVICE)
+                with torch.inference_mode():
+                    base(**enc)
+            if DEVICE == "cuda":
+                torch.cuda.synchronize()
+            log.info(f"warmup done in {(time.perf_counter()-t0):.1f}s")
+        except Exception as e:
+            log.warning(f"warmup failed ({e}); disabling torch.compile and reloading uncompiled model")
+            if COMPILE:
+                # unwrap compiled module back to the original base
+                inner = getattr(base, "_orig_mod", None)
+                if inner is not None:
+                    base = inner
+                    STATE["base"] = base
+                log.info("continuing without torch.compile")
 
     log.info("service ready")
 
