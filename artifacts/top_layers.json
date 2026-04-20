@@ -1,10 +1,10 @@
 {
   "top_layers": [
+    18,
     3,
     16,
     17,
     15,
-    18,
     12,
     14,
     10,
@@ -33,7 +33,7 @@
     27,
     1
   ],
-  "best_layer": 3,
+  "best_layer": 18,
   "best_score": 2.5797,
   "score_thresh": 0.8,
   "n_pairs": 1060,
