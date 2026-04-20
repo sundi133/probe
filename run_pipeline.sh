@@ -61,13 +61,13 @@ run_step() {
 }
 
 # ── Run steps ─────────────────────────────────────────────────────────────────
-run_step 1 step1_generate_dataset.py     "Generate adversarial dataset"
-run_step 2 step2_find_directions.py      "Find refusal directions"
-run_step 3 step3_build_probe.py          "Build probe config"
-run_step 4 step4_calibrate.py            "Calibrate threshold (recall>=$TARGET_RECALL)"
-run_step 5 step5_eval_per_category.py    "Evaluate per category (F1 warn<$F1_WARN)"
-run_step 6 step6_regression_test.py      "Regression test (safe FPR<$MAX_FPR)"
-run_step 7 07_fixed.py                   "Confidence intervals (N=$N_BOOTSTRAP)"
+run_step 1 01.py     "Generate adversarial dataset"
+run_step 2 02.py      "Find refusal directions"
+run_step 3 03.py      "Build probe config"
+run_step 4 04.py      "Calibrate threshold (recall>=$TARGET_RECALL)"
+run_step 5 05.py      "Evaluate per category (F1 warn<$F1_WARN)"
+run_step 6 06.py      "Regression test (safe FPR<$MAX_FPR)"
+run_step 7 07.py      "Confidence intervals (N=$N_BOOTSTRAP)"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo "========================================"
