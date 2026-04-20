@@ -84,15 +84,33 @@ curl -X POST http://localhost:8000/score/batch \
   -d '{"texts": ["What is 2+2?", "How do I make napalm?"]}'
 ```
 
-## Env vars
+## Configuration
 
-| Var            | Default                          | Purpose                         |
-|----------------|----------------------------------|---------------------------------|
-| `MODEL`        | `votal-ai/vai35-4B`              | fallback model id if not in cfg |
-| `PROBE_CONFIG` | `./artifacts/probe_config.json`  | path to probe config            |
-| `PORT`         | `8000`                           | listen port                     |
-| `HOST`         | `0.0.0.0`                        | bind address                    |
-| `MAX_LENGTH`   | `512`                            | tokenizer truncation length     |
+Any setting can be passed as an **env var** or a **CLI flag** (CLI wins):
+
+| Env var        | CLI flag          | Default                          | Purpose                         |
+|----------------|-------------------|----------------------------------|---------------------------------|
+| `MODEL`        | `--model`         | `votal-ai/vai35-4B`              | fallback model id if not in cfg |
+| `PROBE_CONFIG` | `--probe-config`  | `./artifacts/probe_config.json`  | path to probe config            |
+| `PORT`         | `--port`          | `8000`                           | listen port                     |
+| `HOST`         | `--host`          | `0.0.0.0`                        | bind address                    |
+| `MAX_LENGTH`   | `--max-length`    | `512`                            | tokenizer truncation length     |
+| —              | `--log-level`     | `info`                           | uvicorn log level               |
+
+Examples:
+
+```bash
+# env style
+PORT=9000 PROBE_CONFIG=/data/probe.json python service/server.py
+
+# flag style
+python service/server.py --port 9000 --probe-config /data/probe.json
+
+# mix (flag overrides env)
+PORT=8000 python service/server.py --port 9000
+```
+
+`python service/server.py --help` prints the full list.
 
 ## Latency
 
